@@ -38,14 +38,77 @@ struct os_priv *priv1;
 
 //////// Device operations ////////
 
-int os_open(struct net_device *dev) { return 0; }
+int os_open(struct net_device *dev) {
+    netif_start_queue(dev);
+    return 0;
+}
 
-int os_stop(struct net_device *dev) { return 0; }
+int os_stop(struct net_device *dev) {
+    netif_stop_queue(dev);
+    return 0;
+}
 
-int os_start_xmit(struct sk_buff *skb, struct net_device *dev) { return 0; }
+int os_rx_i_handler(struct net_device *dev) { return 0; }
+int os_tx_i_handler(struct net_device *dev) { return 0; }
+
+int os_start_xmit(struct sk_buff *skb, struct net_device *dev) {
+    struct iphdr *ih;
+    struct os_priv *priv;
+    char *data;
+    int len;
+    u32 *saddr;
+    u32 *daddr;
+
+    // Determine which private area we are manipulating
+    priv = (dev == os0) ? priv0 : priv1;
+
+    // Extract packet data/length
+    data = skb->data;
+    len = skb->len;
+
+    // Keep buffer in private area
+    priv->skb = skb;
+
+    // Swap source/destination network IPs
+    ih = (struct iphdr *)(data + sizeof(struct ethhdr));
+    saddr = &ih->saddr;
+    daddr = &ih->daddr;
+    ((u8*)saddr)[2] ^= 1;
+    ((u8*)daddr)[2] ^= 1;
+
+    // Checksum
+    ih->check = 0;
+    ih->check = ip_fast_csum((unsigned char *)ih, ih->ihl);
+
+    // Put modified packet into private area
+    priv->pkt->datalen = len;
+    memcpy(priv->pkt->data, data, len);
+
+    // Receive interrupt handler, transmit interrupts
+    os_rx_i_handler(dev);
+    os_tx_i_handler(dev);
+
+    // Free the skb object in private area
+    priv = netdev_priv(skb->dev);
+    dev_kfree_skb(priv->skb);
+
+    // Write interrupt handlers
+    skb = dev_alloc_skb(len);
+    memcpy(skb_put(skb, len), data, len);
+    skb->dev = dev;
+    skb->protocol = eth_type_trans(skb, dev);
+    netif_rx(skb);
+
+    // Enable queue if stopped
+    if (netif_queue_stopped(priv->pkt->dev)) netif_wake_queue(priv->pkt->dev);
+    priv = netdev_priv(dev);
+    if (netif_queue_stopped(priv->pkt->dev)) netif_wake_queue(priv->pkt->dev);
+
+    return 0;
+}
 
 struct net_device_stats *os_stats(struct net_device *dev) {
-  return &(((struct os_priv*)netdev_priv(dev))->stats);
+    return &(((struct os_priv*)netdev_priv(dev))->stats);
 }
 
 //////// Header operations ////////
@@ -53,7 +116,19 @@ struct net_device_stats *os_stats(struct net_device *dev) {
 int os_header(struct sk_buff *skb, struct net_device *dev,
               unsigned short type, const void *daddr, const void *saddr,
               unsigned int len) {
-    return 0;
+    // Place data-link header in front of packet
+    struct ethhdr *eth = (struct ethhdr*)skb_push(skb, ETH_HLEN);
+
+    // Fill MAC addresses (but they will be same...)
+    memcpy(eth->h_source, dev->dev_addr, dev->addr_len);
+    memcpy(eth->h_dest, eth->h_source, dev->addr_len);
+    // ... so we change one to 00:01:02:03:04:06
+    eth->h_dest[ETH_ALEN-1] = (eth->h_dest[ETH_ALEN-1] == 5) ? 6 : 5;
+
+    // Which protocol is packet using?
+    eth->h_proto = htons(type);
+
+    return dev->hard_header_len;
 }
 
 
